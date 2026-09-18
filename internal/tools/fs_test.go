@@ -57,6 +57,44 @@ func TestPathTraversal_Rejected(t *testing.T) {
 	}
 }
 
+func TestSymlinkEscape_Rejected(t *testing.T) {
+	workdir := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("top secret"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	link := filepath.Join(workdir, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks not supported in this environment: %v", err)
+	}
+
+	if _, err := readFile(workdir, "escape/secret.txt"); err == nil {
+		t.Error("readFile() error = nil, want symlink escape to be rejected")
+	}
+	if err := writeFile(workdir, "escape/overwrite.txt", "pwned"); err == nil {
+		t.Error("writeFile() error = nil, want symlink escape to be rejected")
+	}
+	if _, err := listFiles(workdir, "escape"); err == nil {
+		t.Error("listFiles() error = nil, want symlink escape to be rejected")
+	}
+}
+
+func TestDotfile_Rejected(t *testing.T) {
+	workdir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workdir, ".env"), []byte("LLM_API_KEY=sk-secret"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	if _, err := readFile(workdir, ".env"); err == nil {
+		t.Error("readFile(\".env\") error = nil, want dotfile access rejected")
+	}
+	if _, err := readFile(workdir, "sub/.git/config"); err == nil {
+		t.Error("readFile(\"sub/.git/config\") error = nil, want dotfile access rejected")
+	}
+}
+
 func TestAbsolutePath_TreatedAsRelativeToWorkdir(t *testing.T) {
 	// filepath.Join treats a leading "/" in the second argument as just
 	// another path segment, so an absolute-looking path stays contained

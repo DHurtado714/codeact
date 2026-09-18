@@ -2,6 +2,42 @@
 
 Una decisión por sección, cada una con su trade-off.
 
+## El sandbox del filesystem asume symlinks y dotfiles hostiles, no solo `..`
+
+**Decisión:** `resolvePath` (`internal/tools/fs.go`) rechaza tres cosas, no
+solo una: un lexical climb con `..`, un componente de path que empiece con
+`.` (bloquea `.env`, `.git`, etc.), y un symlink dentro de `-dir` que apunte
+fuera de él (resuelto con `filepath.EvalSymlinks` antes de comparar contra
+el workdir resuelto).
+
+**Trade-off:** el modelo no tiene forma de crear un symlink desde su JS, pero
+sí puede pedirle a `readFile`/`readCsv` que siga uno que ya exista en el
+directorio — y el riesgo concreto de los dotfiles es peor de lo que parece:
+si alguien corre el agente con `-dir .` (el default) desde el mismo
+directorio donde vive su `.env`, el modelo podría hacer `readFile(".env")` y
+mandar la API key de vuelta al proveedor del LLM como parte de la
+conversación. Bloquear dotfiles por completo es más simple que mantener una
+lista de nombres de archivo sensibles, y no cuesta nada real: un flujo de
+reconciliación no necesita leer archivos ocultos.
+
+## El timeout de `Run` no puede quedar bloqueado por una tool colgada
+
+**Decisión:** al vencer el timeout, `Run` llama a `vm.Interrupt()` y espera
+un `interruptGrace` (2s) adicional por la goroutine que ejecuta el JS — no
+espera indefinidamente. El buffer de output (`safeBuffer`) usa un mutex
+porque, si la goroutine sigue viva después de ese grace period, todavía
+puede estar escribiendo en él.
+
+**Trade-off:** `vm.Interrupt()` es casi instantáneo para un loop infinito en
+JS puro (goja chequea el interrupt entre operaciones), pero no puede
+interrumpir una llamada bloqueada dentro de una tool de Go (por ejemplo, un
+`readFile` sobre un archivo enorme o un pipe). Sin el grace period, una tool
+colgada bloquearía `Run` — y por lo tanto todo el loop del agente —
+indefinidamente, pese al timeout configurado. El costo es aceptar una
+goroutine "leaked" en ese caso raro (vive hasta que la llamada bloqueada
+termine por su cuenta); para un PoC es preferible a que el proceso completo
+se cuelgue.
+
 ## goja en vez de Docker+Python o `go run`
 
 **Decisión:** ejecutar el código del modelo con

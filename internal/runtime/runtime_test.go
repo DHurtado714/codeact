@@ -88,6 +88,26 @@ func TestRun_FreshVMPerCall(t *testing.T) {
 	}
 }
 
+func TestRun_ReturnsPromptlyEvenIfHostToolHangs(t *testing.T) {
+	register := func(vm *goja.Runtime) {
+		vm.Set("hang", func() {
+			time.Sleep(5 * time.Second) // outlives the interrupt grace period
+		})
+	}
+	r := New(50*time.Millisecond, register)
+
+	start := time.Now()
+	res := r.Run(`hang()`)
+	elapsed := time.Since(start)
+
+	if res.Err == nil {
+		t.Fatal("Run() error = nil, want timeout error")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("Run() took %v, want it to give up waiting on the stuck host call well under 3s", elapsed)
+	}
+}
+
 func TestRun_RegisteredToolIsUsable(t *testing.T) {
 	register := func(vm *goja.Runtime) {
 		vm.Set("double", func(n int) int { return n * 2 })

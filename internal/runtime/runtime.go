@@ -4,12 +4,25 @@ package runtime
 import (
 	"bytes"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/dop251/goja"
 )
 
-const defaultTimeout = 10 * time.Second
+const (
+	defaultTimeout = 10 * time.Second
+	// interruptGrace bounds how long Run waits for the executing goroutine
+	// to unwind after vm.Interrupt(). goja checks for an interrupt between
+	// JS-level operations, so a pure-JS infinite loop stops almost
+	// immediately; this grace period only matters if the JS is blocked
+	// inside a host tool call (e.g. a slow file read) that Interrupt can't
+	// preempt. After the grace period Run gives up and returns anyway, so a
+	// stuck tool call can't hang the whole agent loop — at the cost of
+	// leaking that one goroutine until the blocked call eventually returns.
+	interruptGrace = 2 * time.Second
+)
 
 // Result is what a Run call produces. Err is never a Go-level failure of
 // Run itself — it's the JS program's own failure (syntax error, thrown
@@ -39,6 +52,28 @@ func New(timeout time.Duration, register Register) *Runtime {
 	return &Runtime{timeout: timeout, register: register}
 }
 
+// safeBuffer guards a bytes.Buffer with a mutex. It exists because, on the
+// interruptGrace path below, Run can return and read the buffer's contents
+// while the (by then abandoned) execution goroutine is still running and
+// may still call print — without the lock that would be a data race.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) writeLine(s string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.WriteString(s)
+	b.buf.WriteByte('\n')
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // Run executes code in a brand-new VM and returns what it printed and/or
 // how it failed. It never panics and never returns a Go error directly.
 //
@@ -47,16 +82,14 @@ func New(timeout time.Duration, register Register) *Runtime {
 // leaking from a previous (possibly failed) attempt.
 func (r *Runtime) Run(code string) Result {
 	vm := goja.New()
-	var out bytes.Buffer
+	var out safeBuffer
 
 	print := func(args ...goja.Value) {
+		parts := make([]string, len(args))
 		for i, a := range args {
-			if i > 0 {
-				out.WriteByte(' ')
-			}
-			out.WriteString(a.String())
+			parts[i] = a.String()
 		}
-		out.WriteByte('\n')
+		out.writeLine(strings.Join(parts, " "))
 	}
 	vm.Set("print", print)
 
@@ -84,7 +117,10 @@ func (r *Runtime) Run(code string) Result {
 		return Result{Output: out.String(), Err: err}
 	case <-time.After(r.timeout):
 		vm.Interrupt("execution timed out")
-		<-done // drain so the goroutine's send doesn't leak
+		select {
+		case <-done:
+		case <-time.After(interruptGrace):
+		}
 		return Result{Output: out.String(), Err: fmt.Errorf("execution timed out after %s", r.timeout)}
 	}
 }
